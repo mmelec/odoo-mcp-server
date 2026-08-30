@@ -45,6 +45,24 @@ def odoo_execute(model, method, *args, **kwargs):
     )
 
 
+def _find_or_create_tag(tag_name: str) -> int:
+    """Cherche une étiquette produit (product.tag) par nom, la crée si absente."""
+    ids = odoo_execute("product.tag", "search", [["name", "=ilike", tag_name]], limit=1)
+    if ids:
+        return ids[0]
+    return odoo_execute("product.tag", "create", {"name": tag_name})
+
+
+def _find_sale_tax(tax_name: str) -> int | None:
+    """Cherche une taxe de vente (account.tax) par nom approximatif (ex. '20%', 'TVA 20')."""
+    ids = odoo_execute(
+        "account.tax", "search",
+        [["name", "ilike", tax_name], ["type_tax_use", "=", "sale"]],
+        limit=1,
+    )
+    return ids[0] if ids else None
+
+
 # Nom de domaine public de ce serveur (ex. odoo-mcp-kcxp.onrender.com), sans https:// ni slash.
 # Sert à autoriser les requêtes venant de ce domaine (protection anti DNS-rebinding du SDK).
 PUBLIC_HOSTNAME = os.environ.get("PUBLIC_HOSTNAME", "")
@@ -78,18 +96,60 @@ def search_products(query: str, limit: int = 10) -> list[dict]:
         return []
     return odoo_execute(
         "product.template", "read", ids,
-        fields=["id", "name", "list_price", "default_code"],
+        fields=["id", "name", "list_price", "standard_price", "default_code",
+                 "taxes_id", "product_tag_ids"],
     )
 
 
 @mcp.tool()
-def create_product(name: str, price: float, description: str = "") -> dict:
-    """Crée un nouveau produit vendable dans Odoo."""
-    product_id = odoo_execute(
-        "product.template", "create",
-        {"name": name, "list_price": price, "sale_ok": True, "description_sale": description},
-    )
-    return {"id": product_id, "name": name, "price": price}
+def create_product(
+    name: str,
+    price: float,
+    cost: float = None,
+    tax_name: str = None,
+    tag: str = None,
+    description: str = "",
+) -> dict:
+    """Crée un nouveau produit vendable dans Odoo.
+
+    Args:
+        name: nom du produit
+        price: prix de vente unitaire (HT)
+        cost: prix d'achat unitaire, si connu
+        tax_name: nom ou taux de la taxe de vente à appliquer (ex. "20%", "TVA 5.5%").
+            Doit correspondre à une taxe déjà configurée dans Odoo ; si aucune
+            correspondance n'est trouvée, le produit est créé sans taxe spécifique.
+        tag: étiquette de catégorisation, généralement le fournisseur (ex. "Rexel",
+            "Cedeo", "123elec"). Créée automatiquement si elle n'existe pas encore.
+        description: description commerciale optionnelle
+    """
+    vals = {
+        "name": name,
+        "list_price": price,
+        "sale_ok": True,
+        "description_sale": description,
+    }
+    if cost is not None:
+        vals["standard_price"] = cost
+
+    warnings = []
+
+    if tax_name:
+        tax_id = _find_sale_tax(tax_name)
+        if tax_id:
+            vals["taxes_id"] = [(6, 0, [tax_id])]
+        else:
+            warnings.append(f"Taxe '{tax_name}' introuvable, produit créé sans taxe spécifique.")
+
+    if tag:
+        tag_id = _find_or_create_tag(tag)
+        vals["product_tag_ids"] = [(6, 0, [tag_id])]
+
+    product_id = odoo_execute("product.template", "create", vals)
+    result = {"id": product_id, "name": name, "price": price}
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 @mcp.tool()
@@ -130,7 +190,15 @@ def create_quote(partner_id: int, lines: list[dict]) -> dict:
 
 
 @mcp.tool()
-def update_product(product_id: int, name: str = None, price: float = None, description: str = None) -> dict:
+def update_product(
+    product_id: int,
+    name: str = None,
+    price: float = None,
+    cost: float = None,
+    tax_name: str = None,
+    tag: str = None,
+    description: str = None,
+) -> dict:
     """Modifie une fiche produit existante dans Odoo.
 
     Seuls les champs fournis (non None) sont modifiés ; les autres restent inchangés.
@@ -139,6 +207,10 @@ def update_product(product_id: int, name: str = None, price: float = None, descr
         product_id: identifiant du produit à modifier (obtenu via search_products)
         name: nouveau nom, si à changer
         price: nouveau prix de vente, si à changer
+        cost: nouveau prix d'achat, si à changer
+        tax_name: nom ou taux de la taxe de vente à appliquer (remplace la taxe existante)
+        tag: étiquette / fournisseur à associer (remplace l'étiquette existante ;
+            créée automatiquement si elle n'existe pas encore)
         description: nouvelle description commerciale, si à changer
     """
     vals = {}
@@ -146,8 +218,23 @@ def update_product(product_id: int, name: str = None, price: float = None, descr
         vals["name"] = name
     if price is not None:
         vals["list_price"] = price
+    if cost is not None:
+        vals["standard_price"] = cost
     if description is not None:
         vals["description_sale"] = description
+
+    warnings = []
+
+    if tax_name is not None:
+        tax_id = _find_sale_tax(tax_name)
+        if tax_id:
+            vals["taxes_id"] = [(6, 0, [tax_id])]
+        else:
+            warnings.append(f"Taxe '{tax_name}' introuvable, taxe inchangée.")
+
+    if tag is not None:
+        tag_id = _find_or_create_tag(tag)
+        vals["product_tag_ids"] = [(6, 0, [tag_id])]
 
     if not vals:
         return {"error": "Aucun champ à modifier n'a été fourni."}
@@ -155,9 +242,13 @@ def update_product(product_id: int, name: str = None, price: float = None, descr
     odoo_execute("product.template", "write", [product_id], vals)
     updated = odoo_execute(
         "product.template", "read", [product_id],
-        fields=["id", "name", "list_price", "default_code", "description_sale"],
+        fields=["id", "name", "list_price", "standard_price", "default_code",
+                 "description_sale", "taxes_id", "product_tag_ids"],
     )
-    return updated[0] if updated else {"error": "Produit introuvable après modification."}
+    result = updated[0] if updated else {"error": "Produit introuvable après modification."}
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 @mcp.tool()
