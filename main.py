@@ -236,11 +236,14 @@ def _resolve_variant_id(template_id: int) -> int:
 
 
 @mcp.tool()
-def create_quote(partner_id: int, lines: list[dict]) -> dict:
+def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
     """Crée un devis (sale.order) dans Odoo pour un client donné.
 
-    lines: liste de dicts avec product_id (id produit obtenu via search_products
-    ou create_product), quantity, et price_unit (optionnel).
+    Args:
+        partner_id: identifiant du client
+        lines: liste de dicts avec product_id (id produit obtenu via
+            search_products ou create_product), quantity, et price_unit (optionnel).
+        title: titre / référence client à afficher sur le devis, optionnel
     """
     order_lines = []
     for line in lines:
@@ -250,11 +253,54 @@ def create_quote(partner_id: int, lines: list[dict]) -> dict:
             vals["price_unit"] = line["price_unit"]
         order_lines.append((0, 0, vals))
 
-    order_id = odoo_execute(
-        "sale.order", "create", {"partner_id": partner_id, "order_line": order_lines}
-    )
+    order_vals = {"partner_id": partner_id, "order_line": order_lines}
+    if title:
+        order_vals["client_order_ref"] = title
+
+    order_id = odoo_execute("sale.order", "create", order_vals)
     return odoo_execute(
-        "sale.order", "read", [order_id], fields=["id", "name", "amount_total", "state"]
+        "sale.order", "read", [order_id],
+        fields=["id", "name", "client_order_ref", "amount_total", "state"],
+    )[0]
+
+
+@mcp.tool()
+def add_product_to_quote(order_id: int, product_id: int, quantity: float = 1, price_unit: float = None) -> dict:
+    """Ajoute une ligne produit à un devis (sale.order) déjà existant.
+
+    Args:
+        order_id: identifiant du devis à modifier (le champ 'id' renvoyé par
+            create_quote, pas son numéro affiché comme "S00012")
+        product_id: identifiant du produit à ajouter (obtenu via search_products
+            ou create_product)
+        quantity: quantité, 1 par défaut
+        price_unit: prix unitaire à surcharger, sinon le prix catalogue est utilisé
+    """
+    variant_id = _resolve_variant_id(product_id)
+    vals = {"product_id": variant_id, "product_uom_qty": quantity}
+    if price_unit is not None:
+        vals["price_unit"] = price_unit
+
+    odoo_execute("sale.order", "write", [order_id], {"order_line": [(0, 0, vals)]})
+    return odoo_execute(
+        "sale.order", "read", [order_id],
+        fields=["id", "name", "amount_total", "state"],
+    )[0]
+
+
+@mcp.tool()
+def set_quote_title(order_id: int, title: str) -> dict:
+    """Ajoute ou modifie le titre / référence client d'un devis existant.
+
+    Args:
+        order_id: identifiant du devis à modifier (le champ 'id' renvoyé par
+            create_quote, pas son numéro affiché comme "S00012")
+        title: le titre / la référence à afficher sur le devis
+    """
+    odoo_execute("sale.order", "write", [order_id], {"client_order_ref": title})
+    return odoo_execute(
+        "sale.order", "read", [order_id],
+        fields=["id", "name", "client_order_ref", "amount_total", "state"],
     )[0]
 
 
