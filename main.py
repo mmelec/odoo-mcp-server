@@ -68,8 +68,12 @@ mcp = FastMCP(
 
 @mcp.tool()
 def search_products(query: str, limit: int = 10) -> list[dict]:
-    """Recherche des produits existants dans Odoo par nom."""
-    ids = odoo_execute("product.template", "search", [["name", "ilike", query]], limit=limit)
+    """Recherche des produits existants dans Odoo par nom OU par référence produit."""
+    ids = odoo_execute(
+        "product.template", "search",
+        ["|", ["name", "ilike", query], ["default_code", "ilike", query]],
+        limit=limit,
+    )
     if not ids:
         return []
     return odoo_execute(
