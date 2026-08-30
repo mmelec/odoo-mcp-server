@@ -15,6 +15,7 @@ import xmlrpc.client
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # --- Configuration Odoo (lue depuis les variables d'environnement / secrets) ---
 ODOO_URL = os.environ["ODOO_URL"].rstrip("/")
@@ -44,7 +45,25 @@ def odoo_execute(model, method, *args, **kwargs):
     )
 
 
-mcp = FastMCP("odoo")
+# Nom de domaine public de ce serveur (ex. odoo-mcp-kcxp.onrender.com), sans https:// ni slash.
+# Sert à autoriser les requêtes venant de ce domaine (protection anti DNS-rebinding du SDK).
+PUBLIC_HOSTNAME = os.environ.get("PUBLIC_HOSTNAME", "")
+
+_allowed_hosts = ["127.0.0.1:*", "localhost:*"]
+_allowed_origins = ["http://127.0.0.1:*", "http://localhost:*"]
+if PUBLIC_HOSTNAME:
+    _allowed_hosts.append(f"{PUBLIC_HOSTNAME}:*")
+    _allowed_hosts.append(PUBLIC_HOSTNAME)
+    _allowed_origins.append(f"https://{PUBLIC_HOSTNAME}")
+
+mcp = FastMCP(
+    "odoo",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts,
+        allowed_origins=_allowed_origins,
+    ),
+)
 
 
 @mcp.tool()
