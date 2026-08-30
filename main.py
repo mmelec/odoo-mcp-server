@@ -209,15 +209,43 @@ def create_partner(
     return {"id": partner_id, "name": name}
 
 
+def _resolve_variant_id(template_id: int) -> int:
+    """Convertit un id de product.template en id de product.product (variante).
+
+    sale.order.line attend une variante, pas un template : search_products et
+    create_product travaillent sur product.template, il faut donc résoudre la
+    variante correspondante avant de construire une ligne de devis. Si le
+    template n'a pas encore de variante indexée (produit tout juste créé),
+    on retente une fois après un court délai.
+    """
+    import time
+
+    for attempt in range(3):
+        variant_ids = odoo_execute(
+            "product.product", "search",
+            [["product_tmpl_id", "=", template_id]], limit=1,
+        )
+        if variant_ids:
+            return variant_ids[0]
+        time.sleep(0.5)
+
+    raise ValueError(
+        f"Aucune variante (product.product) trouvée pour le produit id {template_id}. "
+        "Vérifie que ce produit existe bien et est marqué vendable."
+    )
+
+
 @mcp.tool()
 def create_quote(partner_id: int, lines: list[dict]) -> dict:
     """Crée un devis (sale.order) dans Odoo pour un client donné.
 
-    lines: liste de dicts avec product_id, quantity, et price_unit (optionnel).
+    lines: liste de dicts avec product_id (id produit obtenu via search_products
+    ou create_product), quantity, et price_unit (optionnel).
     """
     order_lines = []
     for line in lines:
-        vals = {"product_id": line["product_id"], "product_uom_qty": line.get("quantity", 1)}
+        variant_id = _resolve_variant_id(line["product_id"])
+        vals = {"product_id": variant_id, "product_uom_qty": line.get("quantity", 1)}
         if "price_unit" in line:
             vals["price_unit"] = line["price_unit"]
         order_lines.append((0, 0, vals))
