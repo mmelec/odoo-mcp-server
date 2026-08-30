@@ -129,6 +129,83 @@ def create_quote(partner_id: int, lines: list[dict]) -> dict:
     )[0]
 
 
+@mcp.tool()
+def update_product(product_id: int, name: str = None, price: float = None, description: str = None) -> dict:
+    """Modifie une fiche produit existante dans Odoo.
+
+    Seuls les champs fournis (non None) sont modifiés ; les autres restent inchangés.
+
+    Args:
+        product_id: identifiant du produit à modifier (obtenu via search_products)
+        name: nouveau nom, si à changer
+        price: nouveau prix de vente, si à changer
+        description: nouvelle description commerciale, si à changer
+    """
+    vals = {}
+    if name is not None:
+        vals["name"] = name
+    if price is not None:
+        vals["list_price"] = price
+    if description is not None:
+        vals["description_sale"] = description
+
+    if not vals:
+        return {"error": "Aucun champ à modifier n'a été fourni."}
+
+    odoo_execute("product.template", "write", [product_id], vals)
+    updated = odoo_execute(
+        "product.template", "read", [product_id],
+        fields=["id", "name", "list_price", "default_code", "description_sale"],
+    )
+    return updated[0] if updated else {"error": "Produit introuvable après modification."}
+
+
+@mcp.tool()
+def find_duplicate_products() -> list[dict]:
+    """Identifie les groupes de produits potentiellement en double dans Odoo
+    (même nom, insensible à la casse et aux espaces superflus).
+
+    Retourne une liste de groupes ; chaque groupe contient les produits
+    partageant le même nom, avec leur id, prix et référence, pour te
+    permettre de choisir lesquels garder ou supprimer via delete_product.
+    N'effectue AUCUNE suppression automatique.
+    """
+    all_ids = odoo_execute("product.template", "search", [])
+    if not all_ids:
+        return []
+    records = odoo_execute(
+        "product.template", "read", all_ids,
+        fields=["id", "name", "list_price", "default_code"],
+    )
+
+    groups: dict[str, list[dict]] = {}
+    for rec in records:
+        key = " ".join(rec["name"].strip().lower().split())
+        groups.setdefault(key, []).append(rec)
+
+    duplicates = [
+        {"name": group[0]["name"], "products": group}
+        for group in groups.values()
+        if len(group) > 1
+    ]
+    return duplicates
+
+
+@mcp.tool()
+def delete_product(product_id: int) -> dict:
+    """Supprime définitivement un produit d'Odoo.
+
+    À utiliser avec précaution : la suppression est irréversible. Utilise
+    find_duplicate_products ou search_products au préalable pour confirmer
+    l'identifiant exact avant de supprimer.
+
+    Args:
+        product_id: identifiant du produit à supprimer
+    """
+    odoo_execute("product.template", "unlink", [product_id])
+    return {"deleted_id": product_id}
+
+
 # --- Protection par clé d'accès ---
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
