@@ -172,13 +172,40 @@ def search_partner(query: str, limit: int = 10) -> list[dict]:
     ids = odoo_execute("res.partner", "search", [["name", "ilike", query]], limit=limit)
     if not ids:
         return []
-    return odoo_execute("res.partner", "read", ids, fields=["id", "name", "email", "phone"])
+    return odoo_execute(
+        "res.partner", "read", ids,
+        fields=["id", "name", "email", "phone", "street", "zip", "city"],
+    )
 
 
 @mcp.tool()
-def create_partner(name: str, email: str = "", phone: str = "") -> dict:
-    """Crée un nouveau contact / client dans Odoo."""
-    partner_id = odoo_execute("res.partner", "create", {"name": name, "email": email, "phone": phone})
+def create_partner(
+    name: str,
+    email: str = "",
+    phone: str = "",
+    street: str = "",
+    zip: str = "",
+    city: str = "",
+) -> dict:
+    """Crée un nouveau contact / client dans Odoo.
+
+    Args:
+        name: nom du contact ou de l'entreprise
+        email: email optionnel
+        phone: téléphone optionnel
+        street: adresse (numéro et rue) optionnelle
+        zip: code postal optionnel
+        city: ville optionnelle
+    """
+    vals = {"name": name, "email": email, "phone": phone}
+    if street:
+        vals["street"] = street
+    if zip:
+        vals["zip"] = zip
+    if city:
+        vals["city"] = city
+
+    partner_id = odoo_execute("res.partner", "create", vals)
     return {"id": partner_id, "name": name}
 
 
