@@ -235,6 +235,20 @@ def _resolve_variant_id(template_id: int) -> int:
     )
 
 
+def _build_line_name(variant_id: int, note: str = None) -> str | None:
+    """Construit le texte de la ligne de devis : nom du produit + note optionnelle.
+
+    Si note est fourni, renvoie "Nom du produit\\nnote" pour que la note
+    apparaisse comme descriptif sous le nom sur le devis. Sinon renvoie None
+    pour laisser Odoo utiliser le nom par défaut du produit.
+    """
+    if not note:
+        return None
+    product = odoo_execute("product.product", "read", [variant_id], fields=["name"])
+    product_name = product[0]["name"] if product else ""
+    return f"{product_name}\n{note}" if product_name else note
+
+
 @mcp.tool()
 def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
     """Crée un devis (sale.order) dans Odoo pour un client donné.
@@ -242,7 +256,9 @@ def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
     Args:
         partner_id: identifiant du client
         lines: liste de dicts avec product_id (id produit obtenu via
-            search_products ou create_product), quantity, et price_unit (optionnel).
+            search_products ou create_product), quantity, price_unit (optionnel),
+            et note (texte descriptif optionnel affiché sous le nom du produit
+            sur la ligne, utile par exemple pour détailler une ligne "Main d'œuvre").
         title: titre / référence client à afficher sur le devis, optionnel
     """
     order_lines = []
@@ -251,6 +267,9 @@ def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
         vals = {"product_id": variant_id, "product_uom_qty": line.get("quantity", 1)}
         if "price_unit" in line:
             vals["price_unit"] = line["price_unit"]
+        line_name = _build_line_name(variant_id, line.get("note"))
+        if line_name:
+            vals["name"] = line_name
         order_lines.append((0, 0, vals))
 
     order_vals = {"partner_id": partner_id, "order_line": order_lines}
@@ -265,7 +284,13 @@ def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
 
 
 @mcp.tool()
-def add_product_to_quote(order_id: int, product_id: int, quantity: float = 1, price_unit: float = None) -> dict:
+def add_product_to_quote(
+    order_id: int,
+    product_id: int,
+    quantity: float = 1,
+    price_unit: float = None,
+    note: str = None,
+) -> dict:
     """Ajoute une ligne produit à un devis (sale.order) déjà existant.
 
     Args:
@@ -275,11 +300,16 @@ def add_product_to_quote(order_id: int, product_id: int, quantity: float = 1, pr
             ou create_product)
         quantity: quantité, 1 par défaut
         price_unit: prix unitaire à surcharger, sinon le prix catalogue est utilisé
+        note: texte descriptif optionnel affiché sous le nom du produit sur la
+            ligne, utile par exemple pour détailler une ligne "Main d'œuvre"
     """
     variant_id = _resolve_variant_id(product_id)
     vals = {"product_id": variant_id, "product_uom_qty": quantity}
     if price_unit is not None:
         vals["price_unit"] = price_unit
+    line_name = _build_line_name(variant_id, note)
+    if line_name:
+        vals["name"] = line_name
 
     odoo_execute("sale.order", "write", [order_id], {"order_line": [(0, 0, vals)]})
     return odoo_execute(
