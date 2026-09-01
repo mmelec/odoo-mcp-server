@@ -255,14 +255,20 @@ def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
 
     Args:
         partner_id: identifiant du client
-        lines: liste de dicts avec product_id (id produit obtenu via
-            search_products ou create_product), quantity, price_unit (optionnel),
-            et note (texte descriptif optionnel affiché sous le nom du produit
-            sur la ligne, utile par exemple pour détailler une ligne "Main d'œuvre").
+        lines: liste de dicts, dans l'ordre d'affichage souhaité. Deux types de
+            lignes possibles :
+            - ligne produit : {product_id, quantity, price_unit (optionnel),
+              note (optionnel, texte affiché sous le nom du produit, utile par
+              exemple pour détailler une ligne "Main d'œuvre")}
+            - ligne de section (titre de lot, ex. "Électricité") :
+              {section: "Titre du lot"}
         title: titre / référence client à afficher sur le devis, optionnel
     """
     order_lines = []
     for line in lines:
+        if "section" in line:
+            order_lines.append((0, 0, {"display_type": "line_section", "name": line["section"]}))
+            continue
         variant_id = _resolve_variant_id(line["product_id"])
         vals = {"product_id": variant_id, "product_uom_qty": line.get("quantity", 1)}
         if "price_unit" in line:
@@ -311,6 +317,27 @@ def add_product_to_quote(
     if line_name:
         vals["name"] = line_name
 
+    odoo_execute("sale.order", "write", [order_id], {"order_line": [(0, 0, vals)]})
+    return odoo_execute(
+        "sale.order", "read", [order_id],
+        fields=["id", "name", "amount_total", "state"],
+    )[0]
+
+
+@mcp.tool()
+def add_quote_section(order_id: int, title: str) -> dict:
+    """Ajoute une ligne de section (titre de lot) à un devis existant.
+
+    Utile pour organiser un devis en plusieurs lots, ex. "Électricité",
+    "Plomberie", "VMC" — les produits ajoutés ensuite avec add_product_to_quote
+    apparaîtront sous la dernière section ajoutée, dans l'ordre du devis.
+
+    Args:
+        order_id: identifiant du devis à modifier (le champ 'id' renvoyé par
+            create_quote, pas son numéro affiché comme "S00012")
+        title: titre de la section (ex. "Électricité")
+    """
+    vals = {"display_type": "line_section", "name": title}
     odoo_execute("sale.order", "write", [order_id], {"order_line": [(0, 0, vals)]})
     return odoo_execute(
         "sale.order", "read", [order_id],
