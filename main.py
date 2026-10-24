@@ -9,6 +9,7 @@ Protégé par une clé d'accès (SERVER_API_KEY) : sans elle, personne ne
 peut utiliser tes outils Odoo même s'il trouve l'URL du serveur.
 """
 
+import math
 import os
 import xmlrpc.client
 
@@ -113,10 +114,12 @@ def create_product(
     cost_tax_name: str = None,
     tag: str = None,
     description: str = "",
+    reference: str = None,
 ) -> dict:
     """Crée un nouveau produit vendable dans Odoo.
 
     Args:
+        reference: référence interne (default_code), ex. référence Yesss
         name: nom du produit
         price: prix de vente unitaire (HT)
         price_tax_name: nom ou taux de la taxe de VENTE à appliquer sur le prix
@@ -138,6 +141,8 @@ def create_product(
     }
     if cost is not None:
         vals["standard_price"] = cost
+    if reference:
+        vals["default_code"] = reference
 
     warnings = []
 
@@ -161,6 +166,93 @@ def create_product(
 
     product_id = odoo_execute("product.template", "create", vals)
     result = {"id": product_id, "name": name, "price": price}
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+@mcp.tool()
+def create_products(
+    products: list[dict],
+    price_tax_name: str = "10% G",
+    cost_tax_name: str = "20%",
+    tag: str = "Yesss",
+    dry_run: bool = False,
+) -> dict:
+    """Crée plusieurs produits d'un coup (import fournisseur).
+
+    Chaque produit : {reference, name, price, cost}. Le nom final est
+    "<name> - <reference>". Les références (default_code) déjà présentes dans
+    Odoo sont ignorées (pas de doublon).
+
+    Args:
+        products: liste de {reference, name, price, cost}
+        price_tax_name: taxe de vente (défaut "10% G")
+        cost_tax_name: taxe d'achat (défaut "20%")
+        tag: étiquette fournisseur (défaut "Yesss")
+        dry_run: si True, ne crée rien et indique ce qui serait fait
+    """
+    created, skipped, errors = [], [], []
+    sale_tax = _find_tax(price_tax_name, "sale") if price_tax_name else None
+    buy_tax = _find_tax(cost_tax_name, "purchase") if cost_tax_name else None
+    warnings = []
+    if price_tax_name and not sale_tax:
+        warnings.append(f"Taxe de vente '{price_tax_name}' introuvable.")
+    if cost_tax_name and not buy_tax:
+        warnings.append(f"Taxe d'achat '{cost_tax_name}' introuvable.")
+    tag_id = None if (dry_run or not tag) else _find_or_create_tag(tag)
+
+    seen = set()
+    for p in products:
+        ref = (p.get("reference") or "").strip()
+        label = (p.get("name") or "").strip()
+        try:
+            if not ref or not label:
+                raise ValueError("reference et name obligatoires")
+            if ref in seen:
+                skipped.append({"reference": ref, "reason": "doublon dans la liste"})
+                continue
+            seen.add(ref)
+            existing = odoo_execute(
+                "product.template", "search_read",
+                [["default_code", "=", ref]], fields=["id", "name"], limit=1,
+            )
+            if existing:
+                skipped.append({"reference": ref, "id": existing[0]["id"],
+                                "reason": "existe déjà"})
+                continue
+            price = float(p["price"]) if p.get("price") is not None else None
+            cost = float(p["cost"]) if p.get("cost") is not None else None
+            if price is None and cost is not None:
+                price = round(cost * 1.4, 2)
+            if price is None:
+                raise ValueError("price ou cost requis")
+            full_name = f"{label} - {ref}"
+            if dry_run:
+                created.append({"reference": ref, "name": full_name,
+                                "price": price, "cost": cost})
+                continue
+            vals = {
+                "name": full_name, "default_code": ref, "list_price": price,
+                "sale_ok": True,
+            }
+            if cost is not None:
+                vals["standard_price"] = cost
+            if sale_tax:
+                vals["taxes_id"] = [(6, 0, [sale_tax])]
+            if buy_tax:
+                vals["supplier_taxes_id"] = [(6, 0, [buy_tax])]
+            if tag_id:
+                vals["product_tag_ids"] = [(6, 0, [tag_id])]
+            pid = odoo_execute("product.template", "create", vals)
+            created.append({"id": pid, "reference": ref, "name": full_name,
+                            "price": price, "cost": cost})
+        except Exception as e:  # noqa: BLE001
+            errors.append({"reference": ref, "error": str(e)})
+
+    result = {"dry_run": dry_run, "created": created, "skipped_existing": skipped,
+              "errors": errors,
+              "summary": f"{len(created)} à créer/créés, {len(skipped)} ignorés, {len(errors)} erreurs"}
     if warnings:
         result["warnings"] = warnings
     return result
@@ -249,6 +341,45 @@ def _build_line_name(variant_id: int, note: str = None) -> str | None:
     return f"{product_name}\n{note}" if product_name else note
 
 
+# --- Heures allouées par devis (champ interne, non visible du client) ---
+# Taux horaire de la main d'œuvre, en € HT. Modifiable via la variable
+# d'environnement HOURLY_RATE sur Render si le tarif change.
+HOURLY_RATE = float(os.environ.get("HOURLY_RATE", "55"))
+# Lignes qui comptent dans le calcul (motifs « =ilike », insensibles à la casse) :
+# - produits dont le nom commence par « ense »
+# - produits « Main d'œuvre » (couvre « d'oeuvre », « d'œuvre » et l'apostrophe typographique)
+HOURS_PRODUCT_PATTERNS = ["ense%", "%main d%uvre%"]
+HOURS_FIELD = "x_studio_nb_heures"
+
+
+def _compute_quote_hours(order_id: int) -> float:
+    """Calcule les heures allouées d'un devis.
+
+    Pour chaque ligne concernée (produits « ense… » et « Main d'œuvre »), le
+    montant HT (price_subtotal) est divisé par le taux horaire et arrondi à la
+    demi-heure inférieure ; le total est la somme de ces heures par ligne.
+    Ex. avec 55 €/h : ense à 65 € -> 1 h, main d'œuvre à 120 € -> 2 h, total 3 h.
+    """
+    name_filters = [["product_id.name", "=ilike", pattern] for pattern in HOURS_PRODUCT_PATTERNS]
+    # domaine Odoo : order_id = X ET (nom ~ motif1 OU nom ~ motif2)
+    domain = [["order_id", "=", order_id]] + ["|"] * (len(name_filters) - 1) + name_filters
+    order_lines = odoo_execute(
+        "sale.order.line", "search_read", domain, fields=["price_subtotal"],
+    )
+    # petite marge (1e-9) pour éviter qu'un arrondi flottant fasse perdre une demi-heure
+    return sum(
+        math.floor(l["price_subtotal"] * 2 / HOURLY_RATE + 1e-9) / 2
+        for l in order_lines
+    )
+
+
+def _update_quote_hours(order_id: int) -> float:
+    """Recalcule les heures du devis et les enregistre dans x_studio_nb_heures."""
+    hours = _compute_quote_hours(order_id)
+    odoo_execute("sale.order", "write", [order_id], {HOURS_FIELD: hours})
+    return hours
+
+
 @mcp.tool()
 def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
     """Crée un devis (sale.order) dans Odoo pour un client donné.
@@ -262,7 +393,11 @@ def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
               exemple pour détailler une ligne "Main d'œuvre")}
             - ligne de section (titre de lot, ex. "Électricité") :
               {section: "Titre du lot"}
-        title: titre / référence client à afficher sur le devis, optionnel
+        title: titre du devis (champ x_studio_titre), optionnel
+
+    Les heures allouées (champ interne x_studio_nb_heures) sont calculées
+    automatiquement à partir des lignes « ense… » et « Main d'œuvre » (arrondi
+    à la demi-heure inférieure ligne par ligne, puis somme).
     """
     order_lines = []
     for line in lines:
@@ -280,12 +415,13 @@ def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
 
     order_vals = {"partner_id": partner_id, "order_line": order_lines}
     if title:
-        order_vals["client_order_ref"] = title
+        order_vals["x_studio_titre"] = title
 
     order_id = odoo_execute("sale.order", "create", order_vals)
+    _update_quote_hours(order_id)
     return odoo_execute(
         "sale.order", "read", [order_id],
-        fields=["id", "name", "client_order_ref", "amount_total", "state"],
+        fields=["id", "name", "x_studio_titre", HOURS_FIELD, "amount_total", "state"],
     )[0]
 
 
@@ -318,9 +454,31 @@ def add_product_to_quote(
         vals["name"] = line_name
 
     odoo_execute("sale.order", "write", [order_id], {"order_line": [(0, 0, vals)]})
+    _update_quote_hours(order_id)
     return odoo_execute(
         "sale.order", "read", [order_id],
-        fields=["id", "name", "amount_total", "state"],
+        fields=["id", "name", HOURS_FIELD, "amount_total", "state"],
+    )[0]
+
+
+@mcp.tool()
+def recompute_quote_hours(order_id: int) -> dict:
+    """Recalcule les heures allouées (x_studio_nb_heures) d'un devis existant.
+
+    À utiliser après avoir modifié les lignes ou les prix directement dans Odoo,
+    ou pour renseigner les heures d'un devis créé avant l'ajout de ce champ.
+    Règle : pour chaque ligne « ense… » ou « Main d'œuvre », montant HT divisé par
+    le taux horaire (55 € par défaut) et arrondi à la demi-heure inférieure ;
+    les heures du devis sont la somme de ces lignes.
+
+    Args:
+        order_id: identifiant du devis (le champ 'id' renvoyé par create_quote,
+            pas son numéro affiché comme "S00012")
+    """
+    _update_quote_hours(order_id)
+    return odoo_execute(
+        "sale.order", "read", [order_id],
+        fields=["id", "name", HOURS_FIELD, "amount_total", "state"],
     )[0]
 
 
@@ -347,18 +505,154 @@ def add_quote_section(order_id: int, title: str) -> dict:
 
 @mcp.tool()
 def set_quote_title(order_id: int, title: str) -> dict:
-    """Ajoute ou modifie le titre / référence client d'un devis existant.
+    """Ajoute ou modifie le titre (champ x_studio_titre) d'un devis existant.
 
     Args:
         order_id: identifiant du devis à modifier (le champ 'id' renvoyé par
             create_quote, pas son numéro affiché comme "S00012")
-        title: le titre / la référence à afficher sur le devis
+        title: le titre à afficher sur le devis
     """
-    odoo_execute("sale.order", "write", [order_id], {"client_order_ref": title})
+    odoo_execute("sale.order", "write", [order_id], {"x_studio_titre": title})
     return odoo_execute(
         "sale.order", "read", [order_id],
-        fields=["id", "name", "client_order_ref", "amount_total", "state"],
+        fields=["id", "name", "x_studio_titre", "amount_total", "state"],
     )[0]
+
+
+QUOTE_STATE_LABELS = {
+    "draft": "Devis",
+    "sent": "Devis envoyé",
+    "sale": "Bon de commande (confirmé)",
+    "done": "Verrouillé",
+    "cancel": "Annulé",
+}
+
+# Case à cocher (Studio) : cochée quand une commande fournisseur a été générée pour le devis
+SUPPLIER_ORDER_FIELD = "x_studio_commande_fournisseur"
+
+QUOTE_SUMMARY_FIELDS = [
+    "id", "name", "partner_id", "date_order", "state",
+    "x_studio_titre", HOURS_FIELD, SUPPLIER_ORDER_FIELD, "amount_untaxed", "amount_total",
+]
+
+
+def _with_state_label(record: dict) -> dict:
+    record["state_label"] = QUOTE_STATE_LABELS.get(record.get("state"), record.get("state"))
+    return record
+
+
+@mcp.tool()
+def search_quotes(query: str, limit: int = 10) -> list[dict]:
+    """Recherche des devis existants par nom de client, numéro de devis ou titre.
+
+    Exemples de recherche : "BOUFEDJI" (nom du client), "S00012" (numéro du
+    devis), "salle de bain" (mot du titre). Les plus récents sont renvoyés en
+    premier. Renvoie un résumé de chaque devis (id, numéro, client, date, état,
+    titre, heures, montants) ; utilise get_quote avec l'id pour voir le détail
+    des lignes.
+
+    Args:
+        query: texte à rechercher (client, numéro ou titre)
+        limit: nombre maximum de devis renvoyés
+    """
+    domain = [
+        "|", "|",
+        ["partner_id.name", "ilike", query],
+        ["name", "ilike", query],
+        ["x_studio_titre", "ilike", query],
+    ]
+    orders = odoo_execute(
+        "sale.order", "search_read", domain,
+        fields=QUOTE_SUMMARY_FIELDS, limit=limit, order="date_order desc, id desc",
+    )
+    return [_with_state_label(o) for o in orders]
+
+
+@mcp.tool()
+def get_quote(order_id: int = None, number: str = None) -> dict:
+    """Lit le détail complet d'un devis : en-tête et toutes les lignes.
+
+    Chaque ligne indique son type (produit, section ou note), le produit, le
+    texte affiché, la quantité, le prix unitaire, la remise et les montants HT/TTC.
+    Fournir soit le numéro du devis (number), soit son id (order_id).
+
+    Args:
+        order_id: identifiant technique du devis (le champ 'id' renvoyé par
+            search_quotes ou create_quote)
+        number: numéro affiché du devis, tel qu'il apparaît dans Odoo
+            (ex. "S00012"), correspondance exacte
+    """
+    if order_id is None:
+        if not number:
+            return {"error": "Fournis un numéro de devis (number) ou un id (order_id)."}
+        found = odoo_execute(
+            "sale.order", "search", [["name", "=ilike", number.strip()]], limit=1,
+        )
+        if not found:
+            return {"error": f"Aucun devis avec le numéro '{number}'. "
+                             "Utilise search_quotes pour une recherche approximative."}
+        order_id = found[0]
+
+    orders = odoo_execute(
+        "sale.order", "read", [order_id],
+        fields=QUOTE_SUMMARY_FIELDS + ["amount_tax"],
+    )
+    if not orders:
+        return {"error": f"Aucun devis avec l'id {order_id}."}
+
+    order_lines = odoo_execute(
+        "sale.order.line", "search_read",
+        [["order_id", "=", order_id]],
+        fields=["sequence", "display_type", "product_id", "name", "product_uom_qty",
+                "price_unit", "discount", "price_subtotal", "price_total"],
+        order="sequence, id",
+    )
+    for line in order_lines:
+        # display_type : False pour une ligne produit, sinon "line_section" ou "line_note"
+        line["type"] = line.pop("display_type") or "product"
+
+    result = _with_state_label(orders[0])
+    result["lines"] = order_lines
+    return result
+
+
+@mcp.tool()
+def delete_quote(order_id: int) -> dict:
+    """Supprime définitivement un devis. Irréversible.
+
+    Odoo n'autorise la suppression que des devis en brouillon, envoyés ou annulés.
+    Un bon de commande confirmé est refusé : il faut d'abord l'annuler dans Odoo.
+    Avant d'appeler cet outil, montre le devis à l'utilisateur (get_quote) et
+    demande-lui de confirmer la suppression.
+
+    Args:
+        order_id: identifiant du devis à supprimer (le champ 'id' renvoyé par
+            search_quotes ou create_quote)
+    """
+    orders = odoo_execute(
+        "sale.order", "read", [order_id],
+        fields=["id", "name", "partner_id", "state", "amount_total"],
+    )
+    if not orders:
+        return {"error": f"Aucun devis avec l'id {order_id}."}
+
+    order = orders[0]
+    if order["state"] in ("sale", "done"):
+        return {
+            "error": (
+                f"Le devis {order['name']} est confirmé ({QUOTE_STATE_LABELS[order['state']]}) : "
+                "il ne peut pas être supprimé. Annule-le d'abord dans Odoo."
+            ),
+            "id": order_id,
+        }
+
+    odoo_execute("sale.order", "unlink", [order_id])
+    return {
+        "deleted_id": order_id,
+        "name": order["name"],
+        "partner": order["partner_id"][1] if order["partner_id"] else None,
+        "amount_total": order["amount_total"],
+    }
 
 
 @mcp.tool()
@@ -371,12 +665,14 @@ def update_product(
     cost_tax_name: str = None,
     tag: str = None,
     description: str = None,
+    reference: str = None,
 ) -> dict:
     """Modifie une fiche produit existante dans Odoo.
 
     Seuls les champs fournis (non None) sont modifiés ; les autres restent inchangés.
 
     Args:
+        reference: nouvelle référence interne (default_code), si à changer
         product_id: identifiant du produit à modifier (obtenu via search_products)
         name: nouveau nom, si à changer
         price: nouveau prix de vente, si à changer
@@ -398,6 +694,8 @@ def update_product(
         vals["standard_price"] = cost
     if description is not None:
         vals["description_sale"] = description
+    if reference is not None:
+        vals["default_code"] = reference
 
     warnings = []
 
@@ -478,6 +776,245 @@ def delete_product(product_id: int) -> dict:
     """
     odoo_execute("product.template", "unlink", [product_id])
     return {"deleted_id": product_id}
+
+
+def _format_quantity(qty: float) -> str:
+    """Quantité sans décimale inutile : 5.0 -> '5', 2.5 -> '2.5'."""
+    return str(int(qty)) if float(qty).is_integer() else str(round(qty, 3))
+
+
+MAX_KIT_DEPTH = 3  # un kit peut contenir d'autres kits, jusqu'à 3 niveaux
+ENSE_PREFIX = "ense"
+KITS_UNAVAILABLE = "__kits_unavailable__"
+
+
+def _load_variants(variant_ids: list, cache: dict) -> None:
+    """Charge dans cache les infos des variantes produit (nom, fiche, référence interne)."""
+    todo = [v for v in set(variant_ids) if v not in cache]
+    if todo:
+        for v in odoo_execute(
+            "product.product", "read", todo, fields=["name", "product_tmpl_id", "default_code"],
+        ):
+            cache[v["id"]] = v
+
+
+def _load_kits(template_ids: list, cache: dict) -> None:
+    """Charge dans cache les nomenclatures de type Kit (mrp.bom « phantom »).
+
+    cache[id_fiche] = [(id_variante_composant, quantité par unité de kit), ...] ;
+    une liste vide signifie « pas un kit ». Si l'application Fabrication n'est
+    pas installée, cache[KITS_UNAVAILABLE] passe à True et aucun kit n'est développé.
+    """
+    todo = [t for t in set(template_ids) if t not in cache]
+    if not todo:
+        return
+    for t in todo:
+        cache[t] = []
+    if cache.get(KITS_UNAVAILABLE):
+        return
+    try:
+        boms = odoo_execute(
+            "mrp.bom", "search_read",
+            [["type", "=", "phantom"], ["product_tmpl_id", "in", todo], ["product_id", "=", False]],
+            fields=["product_tmpl_id", "product_qty", "bom_line_ids"], order="sequence, id",
+        )
+        for bom in boms:
+            tmpl_id = bom["product_tmpl_id"][0]
+            if cache[tmpl_id] or not bom["bom_line_ids"]:
+                continue  # la première nomenclature (par séquence) l'emporte ; kit vide = ignoré
+            bom_lines = odoo_execute(
+                "mrp.bom.line", "read", bom["bom_line_ids"], fields=["product_id", "product_qty"],
+            )
+            factor = bom["product_qty"] or 1.0
+            cache[tmpl_id] = [(l["product_id"][0], l["product_qty"] / factor) for l in bom_lines]
+    except xmlrpc.client.Fault:
+        cache[KITS_UNAVAILABLE] = True
+
+
+@mcp.tool()
+def generate_supplier_order(order_id: int = None, number: str = None, supplier: str = "Yesss") -> dict:
+    """Prépare le fichier d'import de panier d'un fournisseur (Yesss par défaut) à partir d'un devis.
+
+    Les produits « kit » (nomenclature de type Kit dans Odoo, par exemple les
+    références ENSE) sont remplacés par leurs composants, multipliés par la
+    quantité du devis. Seuls les articles associés au fournisseur sont ensuite
+    repris : un article est associé s'il porte l'étiquette du fournisseur
+    (ex. « Yesss ») ou s'il a ce fournisseur dans sa fiche (onglet Achat). Les
+    autres lignes (autres fournisseurs, main d'œuvre, sections, notes) sont
+    ignorées et listées dans « skipped ».
+
+    La référence envoyée est le code article du fournisseur (fiche Achat) s'il
+    existe, sinon la référence interne de l'article. Les lignes d'un même article
+    sont regroupées (quantités additionnées).
+
+    Quand le fichier contient au moins un article, la case « commande fournisseur »
+    (x_studio_commande_fournisseur) du devis est cochée automatiquement.
+
+    Le résultat contient « csv », le contenu exact du fichier : une ligne
+    « REFERENCE;QUANTITE » par article, sans en-tête, fins de ligne Windows
+    (CRLF), comme le modèle d'import. Pour livrer le fichier : l'écrire
+    tel quel (en conservant les CRLF) dans « file_name » et l'envoyer à
+    l'utilisateur, en lui signalant les lignes de « skipped » qui concernent le
+    fournisseur (article associé mais sans référence, ENSE sans kit) et les « warnings ».
+
+    Args:
+        order_id: identifiant technique du devis (renvoyé par search_quotes)
+        number: numéro affiché du devis (ex. "S00012"), correspondance exacte
+        supplier: nom du fournisseur / de l'étiquette, « Yesss » par défaut
+    """
+    if order_id is None:
+        if not number:
+            return {"error": "Fournis un numéro de devis (number) ou un id (order_id)."}
+        found = odoo_execute(
+            "sale.order", "search", [["name", "=ilike", number.strip()]], limit=1,
+        )
+        if not found:
+            return {"error": f"Aucun devis avec le numéro '{number}'."}
+        order_id = found[0]
+
+    orders = odoo_execute("sale.order", "read", [order_id], fields=["name", "partner_id"])
+    if not orders:
+        return {"error": f"Aucun devis avec l'id {order_id}."}
+    order = orders[0]
+
+    lines = odoo_execute(
+        "sale.order.line", "search_read",
+        [["order_id", "=", order_id], ["display_type", "=", False], ["product_id", "!=", False]],
+        fields=["product_id", "name", "product_uom_qty"], order="sequence, id",
+    )
+    if not lines:
+        return {"error": f"Le devis {order['name']} ne contient aucune ligne produit."}
+
+    # --- 1) Développement des kits (ex. ENSE) en articles à commander ---
+    variants: dict = {}
+    kits: dict = {}
+    items, kits_expanded, warnings = [], [], []
+    _load_variants([l["product_id"][0] for l in lines], variants)
+    _load_kits([variants[l["product_id"][0]]["product_tmpl_id"][0] for l in lines], kits)
+
+    def expand(variant_id: int, qty: float, name: str, parent, depth: int) -> None:
+        components = kits.get(variants[variant_id]["product_tmpl_id"][0], [])
+        if components and depth < MAX_KIT_DEPTH:
+            _load_variants([c for c, _ in components], variants)
+            _load_kits([variants[c]["product_tmpl_id"][0] for c, _ in components], kits)
+            if depth == 0:
+                kits_expanded.append({"line": name, "quantity": _format_quantity(qty),
+                                      "components": len(components)})
+            for comp_variant, comp_qty in components:
+                expand(comp_variant, qty * comp_qty, variants[comp_variant]["name"],
+                       parent or name, depth + 1)
+        else:
+            items.append({"variant_id": variant_id, "quantity": qty, "name": name,
+                          "parent": parent, "is_kit_line": depth == 0})
+
+    for line in lines:
+        expand(line["product_id"][0], line["product_uom_qty"], line["name"].split("\n")[0], None, 0)
+
+    if kits.get(KITS_UNAVAILABLE):
+        warnings.append(
+            "Nomenclatures (application Fabrication) introuvables dans Odoo : "
+            "les kits n'ont pas été développés en composants."
+        )
+
+    # --- 2) Association au fournisseur et référence à envoyer ---
+    template_ids = list({variants[i["variant_id"]]["product_tmpl_id"][0] for i in items})
+
+    # par étiquette produit
+    templates = odoo_execute(
+        "product.template", "read", template_ids, fields=["product_tag_ids"],
+    )
+    all_tag_ids = list({t for tpl in templates for t in tpl["product_tag_ids"]})
+    tag_names = {}
+    if all_tag_ids:
+        tag_names = {t["id"]: t["name"] for t in odoo_execute(
+            "product.tag", "read", all_tag_ids, fields=["name"],
+        )}
+    supplier_lc = supplier.strip().lower()
+    tagged_templates = {
+        tpl["id"] for tpl in templates
+        if any(supplier_lc in str(tag_names.get(t, "")).lower() for t in tpl["product_tag_ids"])
+    }
+
+    # par fiche fournisseur (onglet Achat) + code article fournisseur
+    supplier_codes: dict = {}
+    infos = odoo_execute(
+        "product.supplierinfo", "search_read",
+        [["product_tmpl_id", "in", template_ids], ["partner_id.name", "ilike", supplier.strip()]],
+        fields=["product_tmpl_id", "product_code"],
+    )
+    for info in infos:
+        tmpl_id = info["product_tmpl_id"][0]
+        supplier_codes.setdefault(tmpl_id, "")
+        if info.get("product_code") and not supplier_codes[tmpl_id]:
+            supplier_codes[tmpl_id] = info["product_code"].strip()
+
+    totals: dict[str, dict] = {}
+    skipped = []
+
+    def skip(item: dict, reason: str) -> None:
+        entry = {"name": item["name"], "reason": reason}
+        if item["parent"]:
+            entry["kit"] = item["parent"]
+        skipped.append(entry)
+
+    for item in items:
+        variant = variants[item["variant_id"]]
+        tmpl_id = variant["product_tmpl_id"][0]
+        qty = item["quantity"]
+
+        if tmpl_id not in tagged_templates and tmpl_id not in supplier_codes:
+            if item["is_kit_line"] and variant["name"].lower().startswith(ENSE_PREFIX):
+                skip(item, "produit ENSE sans nomenclature Kit dans Odoo (composants inconnus)")
+            else:
+                skip(item, f"non associé à {supplier}")
+            continue
+
+        reference = supplier_codes.get(tmpl_id) or (variant.get("default_code") or "").strip()
+        if not reference:
+            skip(item, f"associé à {supplier} mais sans référence")
+            continue
+        if qty <= 0:
+            skip(item, "quantité nulle")
+            continue
+        if not float(qty).is_integer():
+            warnings.append(f"Quantité non entière pour {reference} : {_format_quantity(qty)}")
+
+        entry = totals.setdefault(
+            reference, {"reference": reference, "name": item["name"], "quantity": 0.0, "kits": []},
+        )
+        entry["quantity"] += qty
+        if item["parent"] and item["parent"] not in entry["kits"]:
+            entry["kits"].append(item["parent"])
+
+    included = list(totals.values())
+    ticked = False
+    if included:
+        try:
+            odoo_execute("sale.order", "write", [order_id], {SUPPLIER_ORDER_FIELD: True})
+            ticked = True
+        except xmlrpc.client.Fault as err:
+            warnings.append(
+                f"Fichier généré, mais la case « {SUPPLIER_ORDER_FIELD} » n'a pas pu être cochée : "
+                f"{str(err)[:200]}"
+            )
+    csv_text = "".join(f"{e['reference']};{_format_quantity(e['quantity'])}\r\n" for e in included)
+    for e in included:
+        e["quantity"] = _format_quantity(e["quantity"])
+        if not e["kits"]:
+            del e["kits"]
+
+    return {
+        "quote": order["name"],
+        "client": order["partner_id"][1] if order["partner_id"] else None,
+        "supplier": supplier,
+        "file_name": f"commande_{supplier.strip().lower()}_{order['name']}.csv",
+        "csv": csv_text,
+        "commande_fournisseur_cochee": ticked,
+        "lines_included": included,
+        "kits_expanded": kits_expanded,
+        "skipped": skipped,
+        "warnings": warnings,
+    }
 
 
 # --- Protection par clé d'accès ---
