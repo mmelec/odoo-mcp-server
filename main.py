@@ -655,6 +655,98 @@ def delete_quote(order_id: int) -> dict:
     }
 
 
+def _template_by_ref(reference: str = None, product_id: int = None) -> dict:
+    """Retrouve une fiche produit par id ou par référence exacte (la plus ancienne)."""
+    if product_id:
+        dom = [["id", "=", product_id]]
+    elif reference:
+        dom = [["default_code", "=", reference]]
+    else:
+        raise ValueError("product_id ou reference requis")
+    res = odoo_execute(
+        "product.template", "search_read", dom,
+        fields=["id", "name", "default_code", "uom_id"], order="id", limit=1,
+    )
+    if not res:
+        raise ValueError(f"Produit introuvable ({reference or product_id})")
+    return res[0]
+
+
+@mcp.tool()
+def create_kit(
+    reference: str = None,
+    product_id: int = None,
+    components: list[dict] = None,
+    replace: bool = True,
+) -> dict:
+    """Crée (ou remplace) la nomenclature de type Kit d'un produit (app Fabrication).
+
+    Args:
+        reference: référence interne du produit kit (ex. "ENSEODAPCSIM"). Si plusieurs
+            fiches ont la même référence, la plus ancienne est utilisée.
+        product_id: alternative à reference (id de la fiche produit)
+        components: liste de {reference | product_id, quantity}. La quantité est
+            exprimée dans l'unité de mesure de la fiche du composant.
+        replace: si True (défaut) et qu'un kit existe déjà, ses composants sont remplacés
+    """
+    if not components:
+        return {"error": "components est vide."}
+    kit = _template_by_ref(reference, product_id)
+
+    lines, summary = [], []
+    for c in components:
+        comp = _template_by_ref(c.get("reference"), c.get("product_id"))
+        variant = _resolve_variant_id(comp["id"])
+        qty = float(c.get("quantity", 1))
+        lines.append((0, 0, {"product_id": variant, "product_qty": qty}))
+        summary.append({"reference": comp["default_code"], "name": comp["name"],
+                        "quantity": qty, "uom": comp["uom_id"][1] if comp["uom_id"] else None})
+
+    try:
+        existing = odoo_execute(
+            "mrp.bom", "search",
+            [["product_tmpl_id", "=", kit["id"]], ["type", "=", "phantom"],
+             ["product_id", "=", False]], limit=1,
+        )
+    except xmlrpc.client.Fault as e:
+        return {"error": "Application Fabrication indisponible ou accès refusé : " + str(e)[:200]}
+
+    if existing:
+        if not replace:
+            return {"error": f"Un kit existe déjà (bom {existing[0]}). Utilise replace=True."}
+        odoo_execute("mrp.bom", "write", existing, {"bom_line_ids": [(5, 0, 0)] + lines})
+        bom_id, action = existing[0], "remplacé"
+    else:
+        bom_id = odoo_execute("mrp.bom", "create", {
+            "product_tmpl_id": kit["id"], "type": "phantom",
+            "product_qty": 1.0, "bom_line_ids": lines,
+        })
+        action = "créé"
+    return {"bom_id": bom_id, "action": action, "kit": kit["default_code"] or kit["name"],
+            "components": summary}
+
+
+@mcp.tool()
+def get_kit(reference: str = None, product_id: int = None) -> dict:
+    """Affiche la nomenclature Kit d'un produit (composants et quantités)."""
+    kit = _template_by_ref(reference, product_id)
+    boms = odoo_execute(
+        "mrp.bom", "search_read",
+        [["product_tmpl_id", "=", kit["id"]], ["type", "=", "phantom"]],
+        fields=["id", "bom_line_ids"], limit=1,
+    )
+    if not boms:
+        return {"kit": kit["default_code"], "components": [], "note": "Pas de kit."}
+    lines = odoo_execute(
+        "mrp.bom.line", "read", boms[0]["bom_line_ids"],
+        fields=["product_id", "product_qty", "product_uom_id"],
+    )
+    return {"bom_id": boms[0]["id"], "kit": kit["default_code"],
+            "components": [{"product": l["product_id"][1], "quantity": l["product_qty"],
+                            "uom": l["product_uom_id"][1] if l["product_uom_id"] else None}
+                           for l in lines]}
+
+
 @mcp.tool()
 def update_product(
     product_id: int,
