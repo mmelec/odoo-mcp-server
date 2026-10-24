@@ -870,6 +870,37 @@ def delete_product(product_id: int) -> dict:
     return {"deleted_id": product_id}
 
 
+@mcp.tool()
+def archive_product(product_ids: list[int], archive: bool = True) -> dict:
+    """Archive (ou désarchive) un ou plusieurs produits, sans les supprimer.
+
+    Un produit archivé disparaît des recherches et des listes mais reste dans
+    l'historique des devis et peut être restauré. Préférable à delete_product
+    quand la fiche a déjà servi.
+
+    Args:
+        product_ids: identifiants des fiches produit (obtenus via search_products)
+        archive: True pour archiver (défaut), False pour restaurer
+    """
+    if not product_ids:
+        return {"error": "product_ids est vide."}
+    found = odoo_execute(
+        "product.template", "search_read",
+        [["id", "in", product_ids], ["active", "in", [True, False]]],
+        fields=["id", "name", "default_code", "active"],
+    )
+    found_ids = [p["id"] for p in found]
+    missing = [i for i in product_ids if i not in found_ids]
+    if found_ids:
+        odoo_execute("product.template", "write", found_ids, {"active": not archive})
+    return {
+        "archived" if archive else "restored": [
+            {"id": p["id"], "reference": p["default_code"], "name": p["name"]} for p in found
+        ],
+        "not_found": missing,
+    }
+
+
 def _format_quantity(qty: float) -> str:
     """Quantité sans décimale inutile : 5.0 -> '5', 2.5 -> '2.5'."""
     return str(int(qty)) if float(qty).is_integer() else str(round(qty, 3))
