@@ -901,6 +901,131 @@ def archive_product(product_ids: list[int], archive: bool = True) -> dict:
     }
 
 
+# --- Facturation (toujours en BROUILLON : la validation reste manuelle dans Odoo) ---
+
+def _invoice_summary(move_id: int) -> dict:
+    m = odoo_execute(
+        "account.move", "read", [move_id],
+        fields=["id", "name", "state", "partner_id", "invoice_origin",
+                "amount_untaxed", "amount_tax", "amount_total"],
+    )[0]
+    m["state_label"] = {"draft": "Brouillon", "posted": "Validée", "cancel": "Annulée"}.get(
+        m["state"], m["state"])
+    return m
+
+
+@mcp.tool()
+def create_invoice_from_quote(
+    order_id: int = None,
+    number: str = None,
+    kind: str = "full",
+    amount: float = None,
+    confirm_quote: bool = False,
+) -> dict:
+    """Crée une facture BROUILLON à partir d'un devis (jamais validée automatiquement).
+
+    Args:
+        order_id: id du devis (ou number)
+        number: numéro du devis, ex. "S00012"
+        kind: "full" = facture complète (déduit les acomptes déjà facturés),
+              "percent" = facture d'acompte en % du devis,
+              "fixed" = facture d'acompte d'un montant fixe
+        amount: pourcentage (kind="percent") ou montant en € (kind="fixed")
+        confirm_quote: si True, confirme d'abord le devis s'il est encore au
+            statut brouillon / envoyé (Odoo n'autorise la facturation qu'après
+            confirmation). À n'utiliser qu'avec l'accord explicite de l'utilisateur.
+    """
+    if kind not in ("full", "percent", "fixed"):
+        return {"error": "kind doit être 'full', 'percent' ou 'fixed'."}
+    if kind != "full" and not amount:
+        return {"error": "amount est obligatoire pour une facture d'acompte."}
+    if order_id is None:
+        if not number:
+            return {"error": "Fournis un numéro de devis (number) ou un id (order_id)."}
+        found = odoo_execute("sale.order", "search", [["name", "=ilike", number.strip()]], limit=1)
+        if not found:
+            return {"error": f"Aucun devis avec le numéro '{number}'."}
+        order_id = found[0]
+
+    order = odoo_execute(
+        "sale.order", "read", [order_id], fields=["name", "state", "invoice_ids", "partner_id"],
+    )
+    if not order:
+        return {"error": f"Aucun devis avec l'id {order_id}."}
+    order = order[0]
+
+    if order["state"] in ("draft", "sent"):
+        if not confirm_quote:
+            return {"error": f"Le devis {order['name']} n'est pas confirmé. Odoo ne permet de "
+                             "facturer qu'un devis confirmé : confirme-le dans Odoo, ou redemande "
+                             "avec confirm_quote=True si l'utilisateur est d'accord."}
+        odoo_execute("sale.order", "action_confirm", [order_id])
+    elif order["state"] == "cancel":
+        return {"error": f"Le devis {order['name']} est annulé."}
+
+    before = set(order["invoice_ids"])
+    ctx = {"active_model": "sale.order", "active_ids": [order_id], "active_id": order_id}
+    wiz_fields = odoo_execute("sale.advance.payment.inv", "fields_get", attributes=["type"])
+    vals = {"advance_payment_method": {"full": "delivered", "percent": "percentage",
+                                       "fixed": "fixed"}[kind]}
+    if kind == "percent":
+        vals["amount"] = amount
+    elif kind == "fixed":
+        if "fixed_amount" in wiz_fields:
+            vals["fixed_amount"] = amount
+        else:
+            vals["amount"] = amount
+
+    try:
+        wiz = odoo_execute("sale.advance.payment.inv", "create", vals, context=ctx)
+        odoo_execute("sale.advance.payment.inv", "create_invoices", [wiz], context=ctx)
+    except xmlrpc.client.Fault as e:
+        return {"error": "Odoo a refusé la création de la facture : " + str(e.faultString)[-400:],
+                "hint": "Pour une facture complète, il faut des lignes facturables "
+                        "(produits facturés à la commande, ou livrés)."}
+
+    after = odoo_execute("sale.order", "read", [order_id], fields=["invoice_ids"])[0]["invoice_ids"]
+    new_ids = [i for i in after if i not in before]
+    if not new_ids:
+        return {"error": "Aucune facture créée (rien à facturer ?)."}
+    return {"quote": order["name"], "invoices": [_invoice_summary(i) for i in new_ids],
+            "note": "Facture en brouillon : à vérifier puis valider dans Odoo."}
+
+
+@mcp.tool()
+def create_invoice(partner_id: int, lines: list[dict], reference: str = None) -> dict:
+    """Crée une facture client libre (sans devis) en BROUILLON.
+
+    Args:
+        partner_id: identifiant du client
+        lines: comme pour create_quote — {product_id, quantity, price_unit
+            (optionnel), note (optionnel)} ou {section: "Titre"}
+        reference: référence client / libellé de la facture, optionnel
+    """
+    inv_lines = []
+    for line in lines:
+        if "section" in line:
+            inv_lines.append((0, 0, {"display_type": "line_section", "name": line["section"]}))
+            continue
+        variant_id = _resolve_variant_id(line["product_id"])
+        vals = {"product_id": variant_id, "quantity": line.get("quantity", 1)}
+        if "price_unit" in line:
+            vals["price_unit"] = line["price_unit"]
+        line_name = _build_line_name(variant_id, line.get("note"))
+        if line_name:
+            vals["name"] = line_name
+        inv_lines.append((0, 0, vals))
+
+    move_vals = {"move_type": "out_invoice", "partner_id": partner_id,
+                 "invoice_line_ids": inv_lines}
+    if reference:
+        move_vals["ref"] = reference
+    move_id = odoo_execute("account.move", "create", move_vals)
+    result = _invoice_summary(move_id)
+    result["note"] = "Facture en brouillon : à vérifier puis valider dans Odoo."
+    return result
+
+
 def _format_quantity(qty: float) -> str:
     """Quantité sans décimale inutile : 5.0 -> '5', 2.5 -> '2.5'."""
     return str(int(qty)) if float(qty).is_integer() else str(round(qty, 3))
