@@ -380,6 +380,33 @@ def _update_quote_hours(order_id: int) -> float:
     return hours
 
 
+# --- Coût de la main d'œuvre = prix de vente ---
+# Règle métier : sur une ligne « Main d'œuvre », le coût (purchase_price, champ du
+# module Marges d'Odoo) est égal au prix de vente unitaire net de remise, donc
+# marge nulle sur la main d'œuvre. Ne s'applique qu'aux lignes « Main d'œuvre »
+# (pas aux produits « ense… », qui contiennent de la fourniture).
+LABOR_PRODUCT_PATTERN = "%main d%uvre%"
+
+
+def _apply_labor_cost(order_id: int) -> None:
+    """Met le coût des lignes « Main d'œuvre » du devis égal à leur prix de vente.
+
+    Sans effet (et sans erreur) si le champ purchase_price n'existe pas sur
+    sale.order.line, c'est-à-dire si le module Marges n'est pas installé.
+    """
+    fields = odoo_execute("sale.order.line", "fields_get", ["purchase_price"], attributes=["type"])
+    if "purchase_price" not in fields:
+        return
+    labor_lines = odoo_execute(
+        "sale.order.line", "search_read",
+        [["order_id", "=", order_id], ["product_id.name", "=ilike", LABOR_PRODUCT_PATTERN]],
+        fields=["price_unit", "discount"],
+    )
+    for l in labor_lines:
+        net_unit_price = l["price_unit"] * (1 - (l.get("discount") or 0) / 100)
+        odoo_execute("sale.order.line", "write", [l["id"]], {"purchase_price": net_unit_price})
+
+
 @mcp.tool()
 def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
     """Crée un devis (sale.order) dans Odoo pour un client donné.
@@ -398,6 +425,9 @@ def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
     Les heures allouées (champ interne x_studio_nb_heures) sont calculées
     automatiquement à partir des lignes « ense… » et « Main d'œuvre » (arrondi
     à la demi-heure inférieure ligne par ligne, puis somme).
+
+    Sur les lignes « Main d'œuvre », le coût est automatiquement égal au prix de
+    vente (marge nulle sur la main d'œuvre).
     """
     order_lines = []
     for line in lines:
@@ -419,6 +449,7 @@ def create_quote(partner_id: int, lines: list[dict], title: str = None) -> dict:
 
     order_id = odoo_execute("sale.order", "create", order_vals)
     _update_quote_hours(order_id)
+    _apply_labor_cost(order_id)
     return odoo_execute(
         "sale.order", "read", [order_id],
         fields=["id", "name", "x_studio_titre", HOURS_FIELD, "amount_total", "state"],
@@ -455,6 +486,7 @@ def add_product_to_quote(
 
     odoo_execute("sale.order", "write", [order_id], {"order_line": [(0, 0, vals)]})
     _update_quote_hours(order_id)
+    _apply_labor_cost(order_id)
     return odoo_execute(
         "sale.order", "read", [order_id],
         fields=["id", "name", HOURS_FIELD, "amount_total", "state"],
