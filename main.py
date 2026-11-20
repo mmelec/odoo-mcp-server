@@ -1010,7 +1010,15 @@ def create_invoice_from_quote(
 
     try:
         wiz = odoo_execute("sale.advance.payment.inv", "create", vals, context=ctx)
-        odoo_execute("sale.advance.payment.inv", "create_invoices", [wiz], context=ctx)
+        try:
+            odoo_execute("sale.advance.payment.inv", "create_invoices", [wiz], context=ctx)
+        except xmlrpc.client.Fault as e:
+            # create_invoices renvoie une action contenant des None que XML-RPC ne sait
+            # pas sérialiser : la facture est déjà créée et validée en base à ce stade,
+            # seule la réponse échoue. On ignore cette erreur précise et on vérifie
+            # ensuite via invoice_ids (voir plus bas) ; toute autre erreur est remontée.
+            if "cannot marshal None" not in str(e.faultString):
+                raise
     except xmlrpc.client.Fault as e:
         return {"error": "Odoo a refusé la création de la facture : " + str(e.faultString)[-400:],
                 "hint": "Pour une facture complète, il faut des lignes facturables "
