@@ -568,8 +568,43 @@ QUOTE_SUMMARY_FIELDS = [
 ]
 
 
+_DONE_FIELD_CACHE = {}
+
+
+def _done_field():
+    """Nom technique de la case Studio « Terminé » du devis (détectée une fois)."""
+    if "name" not in _DONE_FIELD_CACHE:
+        found = None
+        try:
+            fields = odoo_execute(
+                "sale.order", "fields_get", attributes=["type", "string"],
+            )
+            for fname, meta in fields.items():
+                if meta.get("type") != "boolean":
+                    continue
+                label = (meta.get("string") or "").lower()
+                if fname.startswith("x_studio") and ("termin" in fname.lower() or "termin" in label):
+                    found = fname
+                    break
+        except Exception:
+            found = None
+        _DONE_FIELD_CACHE["name"] = found
+    return _DONE_FIELD_CACHE["name"]
+
+
+def _summary_fields(extra=None):
+    fields = QUOTE_SUMMARY_FIELDS + (extra or [])
+    done = _done_field()
+    if done and done not in fields:
+        fields = fields + [done]
+    return fields
+
+
 def _with_state_label(record: dict) -> dict:
     record["state_label"] = QUOTE_STATE_LABELS.get(record.get("state"), record.get("state"))
+    done = _done_field()
+    if done:
+        record["termine"] = bool(record.get(done))
     return record
 
 
@@ -595,7 +630,7 @@ def search_quotes(query: str, limit: int = 10) -> list[dict]:
     ]
     orders = odoo_execute(
         "sale.order", "search_read", domain,
-        fields=QUOTE_SUMMARY_FIELDS, limit=limit, order="date_order desc, id desc",
+        fields=_summary_fields(), limit=limit, order="date_order desc, id desc",
     )
     return [_with_state_label(o) for o in orders]
 
@@ -627,7 +662,7 @@ def get_quote(order_id: int = None, number: str = None) -> dict:
 
     orders = odoo_execute(
         "sale.order", "read", [order_id],
-        fields=QUOTE_SUMMARY_FIELDS + ["amount_tax"],
+        fields=_summary_fields(["amount_tax"]),
     )
     if not orders:
         return {"error": f"Aucun devis avec l'id {order_id}."}
